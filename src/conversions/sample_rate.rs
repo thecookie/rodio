@@ -41,11 +41,6 @@ where
     /// and discards samples for down-sampling. This may introduce audible
     /// distortions in some cases (see [#584](https://github.com/RustAudio/rodio/issues/584)).
     ///
-    /// # Limitations
-    /// Some rate conversions where target rate is high and rates are mutual primes the sample
-    /// interpolation may cause numeric overflows. Conversion between usual sample rates
-    /// 2400, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, ... is expected to work.
-    ///
     /// # Panic
     /// Panics if `from`, `to` or `num_channels` are 0.
     #[inline]
@@ -154,8 +149,12 @@ where
             self.current_span_pos_in_chunk = 0;
         } else {
             // Finding the position of the first sample of the linear interpolation.
-            let req_left_sample =
-                (self.from * self.next_output_span_pos_in_chunk / self.to) % self.from;
+            // A pitched source can make the reduced rates relatively prime. The
+            // product then exceeds u32 even at ordinary 96 kHz output rates.
+            // Wrapping would request an earlier input position and make the
+            // forward-only loop below run until its position counter wraps.
+            let position = u64::from(self.from) * u64::from(self.next_output_span_pos_in_chunk);
+            let req_left_sample = ((position / u64::from(self.to)) % u64::from(self.from)) as u32;
 
             // Advancing `self.current_span`, `self.next_span` and
             // `self.current_span_pos_in_chunk` until the latter variable
@@ -170,7 +169,8 @@ where
         // Note that `self.output_buffer` can be truncated if there is not enough data in
         // `self.next_span`.
         let mut result = None;
-        let numerator = (self.from * self.next_output_span_pos_in_chunk) % self.to;
+        let numerator = ((u64::from(self.from) * u64::from(self.next_output_span_pos_in_chunk))
+            % u64::from(self.to)) as u32;
         for (off, (cur, next)) in self
             .current_span
             .iter()
@@ -248,6 +248,52 @@ mod test {
     use crate::Sample;
     use core::time::Duration;
     use quickcheck::{quickcheck, TestResult};
+
+    #[test]
+    fn relatively_prime_rates_preserve_interpolation_and_bound_input_consumption() {
+        use std::cell::Cell;
+        for (from, to) in [
+            (44_100u32, 48_000u32),
+            (49_201, 96_000),
+            (47_999, 96_000),
+            (96_000, 49_201),
+            (192_001, 192_000),
+        ] {
+            for channels in [1u16, 2] {
+                let consumed = Cell::new(0u64);
+                let budget = (u64::from(from) * 2 + 2) * u64::from(channels);
+                let input = std::iter::from_fn(|| {
+                    let index = consumed.get();
+                    assert!(
+                        index < budget,
+                        "runaway resampling: {from}->{to}, {channels} channels"
+                    );
+                    consumed.set(index + 1);
+                    Some(((index / u64::from(channels)) % 1000) as Sample / 1000.0)
+                });
+                let mut converter = SampleRateConverter::new(
+                    input,
+                    from.try_into().unwrap(),
+                    to.try_into().unwrap(),
+                    channels.try_into().unwrap(),
+                );
+                for frame in 0..u64::from(to) * 2 {
+                    let position = frame as f64 * f64::from(from) / f64::from(to);
+                    let left = position.floor() as u64;
+                    let a = (left % 1000) as f64 / 1000.0;
+                    let b = ((left + 1) % 1000) as f64 / 1000.0;
+                    let expected = a + (b - a) * position.fract();
+                    for _ in 0..channels {
+                        let actual = converter.next().unwrap() as f64;
+                        assert!(
+                            (actual - expected).abs() < 0.000002,
+                            "{from}->{to}, frame {frame}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     quickcheck! {
         /// Check that resampling an empty input produces no output.
